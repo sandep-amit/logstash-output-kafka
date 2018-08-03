@@ -74,6 +74,8 @@ class LogStash::Outputs::Kafka < LogStash::Outputs::Base
   # subset of brokers.
   config :bootstrap_servers, :validate => :string, :default => 'localhost:9092'
 
+  config :dlq_topic_id, :validate => :string
+
   config :block_on_buffer_full, :validate => :boolean, :obsolete => "This options is obsolete"
   # The total bytes of memory the producer can use to buffer records waiting to be sent to the server.
   config :buffer_memory, :validate => :number, :default => 33554432
@@ -257,8 +259,7 @@ class LogStash::Outputs::Kafka < LogStash::Outputs::Base
           nil
         rescue org.apache.kafka.common.KafkaException => e
           # This error is not retriable, drop event
-          # TODO: add DLQ support
-          logger.warn("KafkaProducer.send() failed, dropping record", :exception => e, :record_value => record.value)
+          drop_record(e, record.value)
           nil
         end
       end.compact
@@ -273,9 +274,7 @@ class LogStash::Outputs::Kafka < LogStash::Outputs::Base
             failures << batch[i]
           elsif e.get_cause.is_a? org.apache.kafka.common.KafkaException
             # This error is not retriable, drop event
-            # TODO: add DLQ support
-            logger.warn("KafkaProducer.send() future failed, dropping record", :exception => e.get_cause,
-                        :record_value => batch[i].value)
+            drop_record(e, batch[i].value)
           end
         end
       end
@@ -311,6 +310,26 @@ class LogStash::Outputs::Kafka < LogStash::Outputs::Base
   rescue => e
     @logger.warn('kafka producer threw exception, restarting',
                  :exception => e)
+  end
+
+  def drop_record(exception, serialized_data)
+    if @dlq_topic_id.nil?
+      logger.warn("KafkaProducer.send() failed, dropping record", :exception => exception.get_cause,
+                  :record_value => serialized_data)
+    else
+      logger.warn("KafkaProducer.send() failed, dropping record to DLQ", :exception => exception.get_cause)
+      write_to_dlq(serialized_data)
+    end
+  end
+
+  def write_to_dlq(serialized_data)
+    record = ProducerRecord.new(@dlq_topic_id, serialized_data)
+    @producer.send(record)
+  rescue LogStash::ShutdownSignal
+    @logger.debug('Kafka producer got shutdown signal')
+  rescue => e
+    @logger.warn('kafka producer threw exception while writing to DLQ topic',
+                 :exception => e.get_cause, :record_value => serialized_data)
   end
 
   def create_producer
